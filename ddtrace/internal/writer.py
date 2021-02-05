@@ -8,6 +8,7 @@ from ..api import Response
 from .. import compat
 from .. import _worker
 from ..compat import httplib
+from ..constants import KEEP_SPANS_RATE_KEY
 from ..sampler import BasePrioritySampler
 from ..encoding import Encoder, JSONEncoderV2
 from ..utils.time import StopWatch
@@ -15,6 +16,7 @@ from .logger import get_logger
 from .runtime import container
 from .buffer import BufferFull, BufferItemTooLarge, TraceBuffer
 from .uds import UDSHTTPConnection
+from .sma import SimpleMovingAverage
 
 log = get_logger(__name__)
 
@@ -126,16 +128,27 @@ class AgentWriter(_worker.PeriodicWorkerThread):
         self.dogstatsd = dogstatsd
         self._report_metrics = report_metrics
         self._metrics_reset()
+        self._drop_sma = SimpleMovingAverage()
 
     def _metrics_dist(self, name, count=1, tags=None):
-        if self._report_metrics:
-            self._metrics[name]["count"] += count
-            if tags:
-                self._metrics[name]["tags"].extend(tags)
+        self._metrics[name]["count"] += count
+        if tags:
+            self._metrics[name]["tags"].extend(tags)
 
     def _metrics_reset(self):
-        if self._report_metrics:
-            self._metrics = defaultdict(lambda: {"count": 0, "tags": []})
+        self._metrics = defaultdict(lambda: {"count": 0, "tags": []})
+
+    def _set_drop_rate(self):
+        dropped = sum(
+            self._metrics[metric]["count"]
+            for metric in ("encoder.dropped.traces", "buffer.dropped.traces", "http.dropped.traces")
+        )
+
+        self._drop_sma.set(dropped, self._metrics["writer.accepted.traces"]["count"])
+
+    def _set_keep_rate(self, trace):
+        if trace:
+            trace[0].set_metric(KEEP_SPANS_RATE_KEY, 1.0 - self._drop_sma.get())
 
     def recreate(self):
         writer = self.__class__(
@@ -200,9 +213,9 @@ class AgentWriter(_worker.PeriodicWorkerThread):
             response = self._put(payload, headers)
         except (httplib.HTTPException, OSError, IOError):
             log.error("failed to send traces to Datadog Agent at %s", self.agent_url, exc_info=True)
-            if self._report_metrics:
-                self._metrics_dist("http.errors", tags=["type:err"])
-                self._metrics_dist("http.dropped.bytes", len(payload))
+            self._metrics_dist("http.errors", tags=["type:err"])
+            self._metrics_dist("http.dropped.traces", count)
+            self._metrics_dist("http.dropped.bytes", len(payload))
         else:
             if response.status >= 400:
                 self._metrics_dist("http.errors", tags=["type:%s" % response.status])
@@ -228,6 +241,7 @@ class AgentWriter(_worker.PeriodicWorkerThread):
                     response.status,
                     response.reason,
                 )
+                self._metrics_dist("http.dropped.traces", count)
                 self._metrics_dist("http.dropped.bytes", len(payload))
             elif self._priority_sampler or isinstance(self._sampler, BasePrioritySampler):
                 result_traces_json = response.get_json()
@@ -253,10 +267,15 @@ class AgentWriter(_worker.PeriodicWorkerThread):
         if not spans:
             return
 
+        self._metrics_dist("writer.accepted.traces")
+
+        self._set_keep_rate(spans)
+
         try:
             encoded = self._encoder.encode_trace(spans)
         except Exception:
             log.error("failed to encode trace with encoder %r", self._encoder, exc_info=True)
+            self._metrics_dist("encoder.dropped.traces", 1)
         else:
             try:
                 self._buffer.put(encoded)
@@ -284,25 +303,27 @@ class AgentWriter(_worker.PeriodicWorkerThread):
 
     def flush_queue(self):
         enc_traces = self._buffer.get()
-        if not enc_traces:
-            return
+        if enc_traces:
+            encoded = self._encoder.join_encoded(enc_traces)
+            self._send_payload(encoded, len(enc_traces))
 
-        encoded = self._encoder.join_encoded(enc_traces)
-        self._send_payload(encoded, len(enc_traces))
+            if self._report_metrics:
+                # Note that we cannot use the batching functionality of dogstatsd because
+                # it's not thread-safe.
+                # https://github.com/DataDog/datadogpy/issues/439
+                # This really isn't ideal as now we're going to do a ton of socket calls.
+                try:
+                    self.dogstatsd.increment("datadog.tracer.http.requests")
+                    self.dogstatsd.distribution("datadog.tracer.http.sent.bytes", len(encoded))
+                    self.dogstatsd.distribution("datadog.tracer.http.sent.traces", len(enc_traces))
+                    for name, metric in self._metrics.items():
+                        self.dogstatsd.distribution("datadog.tracer.%s" % name, metric["count"], tags=metric["tags"])
+                finally:
+                    pass
 
-        if self._report_metrics:
-            # Note that we cannot use the batching functionality of dogstatsd because
-            # it's not thread-safe.
-            # https://github.com/DataDog/datadogpy/issues/439
-            # This really isn't ideal as now we're going to do a ton of socket calls.
-            try:
-                self.dogstatsd.increment("datadog.tracer.http.requests")
-                self.dogstatsd.distribution("datadog.tracer.http.sent.bytes", len(encoded))
-                self.dogstatsd.distribution("datadog.tracer.http.sent.traces", len(enc_traces))
-                for name, metric in self._metrics.items():
-                    self.dogstatsd.distribution("datadog.tracer.%s" % name, metric["count"], tags=metric["tags"])
-            finally:
-                self._metrics_reset()
+        self._set_drop_rate()
+
+        self._metrics_reset()
 
     def run_periodic(self):
         self.flush_queue()
